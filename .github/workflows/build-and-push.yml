@@ -21,6 +21,7 @@ jobs:
   build-push-deploy:
     name: Build, Push and Deploy
     runs-on: ubuntu-latest
+    timeout-minutes: 20
 
     steps:
       - name: Checkout repository
@@ -60,6 +61,8 @@ jobs:
           REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
           IMAGE="${REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
 
+          echo "Preparing deployment for image: $IMAGE"
+
           DEPLOY_SCRIPT=$(cat <<'SCRIPT'
           set -Eeuo pipefail
 
@@ -69,41 +72,89 @@ jobs:
           IMAGE="__IMAGE__"
           CONTAINER="wine-quality-api"
 
-          echo "Pulling exact commit image: $IMAGE"
+          echo "Authenticating with ECR..."
           aws ecr get-login-password --region "$REGION" \
             | docker login --username AWS --password-stdin "$REGISTRY"
+
+          echo "Pulling image: $IMAGE"
           docker pull "$IMAGE"
 
           OLD_IMAGE=""
           if docker container inspect "$CONTAINER" >/dev/null 2>&1; then
             OLD_IMAGE="$(docker inspect -f '{{.Image}}' "$CONTAINER")"
+            echo "Previous image ID: $OLD_IMAGE"
             docker rm -f "$CONTAINER"
           fi
 
+          echo "Starting new container..."
           docker run -d \
             --name "$CONTAINER" \
             --restart unless-stopped \
             -p 8000:8000 \
             "$IMAGE"
 
-         
-          echo "Waiting for SSM command: $COMMAND_ID"
+          echo "Checking API health..."
+          for attempt in $(seq 1 30); do
+            if docker exec "$CONTAINER" python -c \
+              "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).read().decode())" \
+              2>/dev/null; then
+              echo "SUCCESS: API is healthy."
+              exit 0
+            fi
+            sleep 2
+          done
+
+          echo "ERROR: Health check failed."
+          docker logs "$CONTAINER" || true
+          docker rm -f "$CONTAINER" || true
+
+          if [ -n "$OLD_IMAGE" ]; then
+            echo "Attempting rollback to previous image..."
+            docker run -d \
+              --name "$CONTAINER" \
+              --restart unless-stopped \
+              -p 8000:8000 \
+              "$OLD_IMAGE"
+          fi
+
+          exit 1
+          SCRIPT
+          )
+
+          DEPLOY_SCRIPT="${DEPLOY_SCRIPT//__IMAGE__/$IMAGE}"
+
+          PARAMETERS="$(jq -n --arg script "$DEPLOY_SCRIPT" \
+            '{commands: [$script]}')"
+
+          echo "Sending deployment command to EC2..."
+
+          COMMAND_ID=$(aws ssm send-command \
+            --document-name "AWS-RunShellScript" \
+            --instance-ids "$EC2_INSTANCE_ID" \
+            --parameters "$PARAMETERS" \
+            --comment "Deploy Wine Quality API commit ${IMAGE_TAG}" \
+            --region "$AWS_REGION" \
+            --query 'Command.CommandId' \
+            --output text)
+
+          echo "SSM command ID: $COMMAND_ID"
 
           for attempt in $(seq 1 60); do
-            RESULT=$(aws ssm list-command-invocations \
+            if ! RESULT=$(aws ssm list-command-invocations \
               --command-id "$COMMAND_ID" \
               --details \
               --region "$AWS_REGION" \
-              --output json) || {
-                echo "ERROR: Unable to retrieve SSM command status."
-                exit 1
-              }
+              --output json 2>&1); then
+              echo "ERROR: Could not retrieve SSM status:"
+              echo "$RESULT"
+              exit 1
+            fi
 
             STATUS=$(echo "$RESULT" | jq -r \
               --arg instance "$EC2_INSTANCE_ID" \
-              '.CommandInvocations[] |
-               select(.InstanceId == $instance) |
-               .Status' | head -n 1)
+              '[.CommandInvocations[] |
+                select(.InstanceId == $instance) |
+                .Status][0] // empty')
 
             echo "Attempt $attempt/60 — SSM status: ${STATUS:-Not available}"
 
@@ -119,7 +170,7 @@ jobs:
                 exit 0
                 ;;
               Failed|Cancelled|TimedOut)
-                echo "Deployment failed with SSM status: $STATUS"
+                echo "Deployment failed: $STATUS"
                 echo "$RESULT" | jq \
                   --arg instance "$EC2_INSTANCE_ID" \
                   '.CommandInvocations[] |
@@ -130,13 +181,13 @@ jobs:
                 sleep 5
                 ;;
               *)
-                echo "ERROR: Unexpected SSM status: $STATUS"
+                echo "Unexpected SSM status: $STATUS"
                 echo "$RESULT" | jq .
                 exit 1
                 ;;
             esac
           done
 
-          echo "ERROR: SSM command did not reach a terminal status within 5 minutes."
+          echo "ERROR: SSM did not reach a terminal status within 5 minutes."
           echo "Command ID: $COMMAND_ID"
           exit 1
