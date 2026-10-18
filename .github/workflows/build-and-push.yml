@@ -7,6 +7,10 @@ on:
       - main
   workflow_dispatch:
 
+concurrency:
+  group: wine-quality-api-deployment
+  cancel-in-progress: false
+
 permissions:
   contents: read
   id-token: write
