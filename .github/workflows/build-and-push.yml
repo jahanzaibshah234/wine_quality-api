@@ -287,3 +287,4 @@ jobs:
           echo "ERROR: SSM did not reach a terminal status within 5 minutes."
           echo "Command ID: $COMMAND_ID"
           exit 1
+
