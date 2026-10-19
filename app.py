@@ -23,6 +23,10 @@ if not logger.handlers:
     logger.addHandler(handler)
 
 
+METRIC_NAMESPACE = "WineQualityAPI"
+SERVICE_NAME = "wine-quality-api"
+
+
 def log_event(event: str, **fields):
     """Write a structured JSON event to the application log."""
     log_data = {
@@ -35,6 +39,38 @@ def log_event(event: str, **fields):
     }
 
     logger.info(json.dumps(log_data, allow_nan=False))
+
+
+def emit_metrics(metrics: dict[str, float]):
+    """Emit CloudWatch Embedded Metric Format (EMF) JSON."""
+    units = {
+        "APIRequests": "Count",
+        "API5xxErrors": "Count",
+        "PredictionLatencyMs": "Milliseconds",
+        "PredictionFailures": "Count",
+    }
+
+    metric_definitions = [
+        {"Name": name, "Unit": units[name]}
+        for name in metrics
+    ]
+
+    emf_event = {
+        "_aws": {
+            "Timestamp": time.time_ns() // 1_000_000,
+            "CloudWatchMetrics": [
+                {
+                    "Namespace": METRIC_NAMESPACE,
+                    "Dimensions": [["Service"]],
+                    "Metrics": metric_definitions,
+                }
+            ],
+        },
+        "Service": SERVICE_NAME,
+        **metrics,
+    }
+
+    logger.info(json.dumps(emf_event, allow_nan=False))
 
 
 app = FastAPI(title="Wine Quality Prediction API")
@@ -63,7 +99,7 @@ class WineFeatures(BaseModel):
 
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
-    """Track request IDs, response status codes, and latency."""
+    """Track request IDs, status codes, latency, and request metrics."""
     request_id = str(uuid.uuid4())
     request.state.request_id = request_id
     start_time = time.perf_counter()
@@ -87,6 +123,11 @@ async def log_requests(request: Request, call_next):
             error_type=type(exc).__name__,
         )
 
+        emit_metrics({
+            "APIRequests": 1,
+            "API5xxErrors": 1,
+        })
+
         raise
 
     duration_ms = round(
@@ -104,6 +145,13 @@ async def log_requests(request: Request, call_next):
         status_code=response.status_code,
         duration_ms=duration_ms,
     )
+
+    request_metrics = {"APIRequests": 1}
+
+    if response.status_code >= 500:
+        request_metrics["API5xxErrors"] = 1
+
+    emit_metrics(request_metrics)
 
     return response
 
@@ -159,6 +207,10 @@ def predict(features: WineFeatures, request: Request):
             duration_ms=duration_ms,
         )
 
+        emit_metrics({
+            "PredictionLatencyMs": duration_ms,
+        })
+
         return {
             "prediction": prediction,
             "confidence": confidence,
@@ -178,6 +230,11 @@ def predict(features: WineFeatures, request: Request):
             duration_ms=duration_ms,
             error_type=type(exc).__name__,
         )
+
+        emit_metrics({
+            "PredictionLatencyMs": duration_ms,
+            "PredictionFailures": 1,
+        })
 
         raise
 

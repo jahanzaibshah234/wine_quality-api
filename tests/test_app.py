@@ -55,6 +55,13 @@ def get_json_events(caplog):
 
     return events
 
+def get_emf_events(caplog):
+    """Extract CloudWatch Embedded Metric Format events."""
+    return [
+        event
+        for event in get_json_events(caplog)
+        if "_aws" in event
+    ]
 
 def test_health_endpoint(client):
     response = client.get("/health")
@@ -102,7 +109,7 @@ def test_predict_endpoint(client, caplog):
     prediction_events = [
         event
         for event in events
-        if event["event"] == "prediction_completed"
+        if event.get("event") == "prediction_completed"
     ]
 
     assert len(prediction_events) == 1
@@ -119,7 +126,7 @@ def test_predict_endpoint(client, caplog):
     request_events = [
         event
         for event in events
-        if event["event"] == "request_completed"
+        if event.get("event") == "request_completed"
     ]
 
     assert any(
@@ -127,6 +134,39 @@ def test_predict_endpoint(client, caplog):
         and event["path"] == "/predict"
         and event["status_code"] == 200
         for event in request_events
+    )
+
+    emf_events = get_emf_events(caplog)
+
+    latency_events = [
+        event
+        for event in emf_events
+        if "PredictionLatencyMs" in event
+    ]
+
+    assert len(latency_events) == 1
+
+    latency_event = latency_events[0]
+
+    assert latency_event["Service"] == "wine-quality-api"
+    assert latency_event["PredictionLatencyMs"] >= 0
+
+    cloudwatch_config = latency_event["_aws"]["CloudWatchMetrics"][0]
+
+    assert cloudwatch_config["Namespace"] == "WineQualityAPI"
+    assert cloudwatch_config["Dimensions"] == [["Service"]]
+    assert "request_id" not in cloudwatch_config["Dimensions"][0]
+
+    request_metric_events = [
+        event
+        for event in emf_events
+        if "APIRequests" in event
+    ]
+
+    assert any(
+        event["APIRequests"] == 1
+        and event["Service"] == "wine-quality-api"
+        for event in request_metric_events
     )
 
     # Ensure raw feature values aren't included in structured events.
@@ -150,7 +190,7 @@ def test_predict_rejects_missing_feature(client, caplog):
     events = get_json_events(caplog)
 
     assert any(
-        event["event"] == "request_completed"
+        event.get("event") == "request_completed"
         and event["path"] == "/predict"
         and event["status_code"] == 422
         for event in events
@@ -158,7 +198,19 @@ def test_predict_rejects_missing_feature(client, caplog):
 
     # Validation fails before the prediction function executes.
     assert not any(
-        event["event"] == "prediction_completed"
+        event.get("event") == "prediction_completed"
         for event in events
     )
 
+    emf_events = get_emf_events(caplog)
+
+    assert any(
+        event.get("APIRequests") == 1
+        for event in emf_events
+    )
+
+    # HTTP 422 is a client-side validation error, not a server error.
+    assert not any(
+        event.get("API5xxErrors") == 1
+        for event in emf_events
+    )
