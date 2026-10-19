@@ -97,7 +97,6 @@ class WineFeatures(BaseModel):
     sulphates: float
     alcohol: float
 
-
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
     """Track request IDs, status codes, latency, and request metrics."""
@@ -147,15 +146,12 @@ async def log_requests(request: Request, call_next):
         duration_ms=duration_ms,
     )
 
-    request_metrics = {"APIRequests": 1}
-
-    if response.status_code >= 500:
-        request_metrics["API5xxErrors"] = 1
-
-    emit_metrics(request_metrics)
+    emit_metrics({
+        "APIRequests": 1,
+        "API5xxErrors": 1 if response.status_code >= 500 else 0,
+    })
 
     return response
-
 
 @app.get("/health")
 def health():
@@ -210,6 +206,7 @@ def predict(features: WineFeatures, request: Request):
 
         emit_metrics({
             "PredictionLatencyMs": duration_ms,
+            "PredictionFailures": 0,
         })
 
         return {

@@ -154,6 +154,16 @@ def test_predict_endpoint(client, caplog):
     cloudwatch_config = latency_event["_aws"]["CloudWatchMetrics"][0]
 
     assert cloudwatch_config["Namespace"] == "WineQualityAPI"
+
+    assert any(
+        event.get("API5xxErrors") == 0
+        for event in emf_events
+    )
+
+    assert any(
+        event.get("PredictionFailures") == 0
+        for event in emf_events
+    )
     assert cloudwatch_config["Dimensions"] == [["Service"]]
     assert "request_id" not in cloudwatch_config["Dimensions"][0]
 
@@ -206,6 +216,12 @@ def test_predict_rejects_missing_feature(client, caplog):
 
     assert any(
         event.get("APIRequests") == 1
+        for event in emf_events
+    )
+
+        # HTTP 422 validation errors are not server errors.
+    assert any(
+        event.get("API5xxErrors") == 0
         for event in emf_events
     )
 
