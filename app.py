@@ -50,9 +50,10 @@ def emit_metrics(metrics: dict[str, float]):
         "PredictionFailures": "Count",
     }
 
+    # Declare all metric names so CloudWatch can discover them.
     metric_definitions = [
-        {"Name": name, "Unit": units[name]}
-        for name in metrics
+        {"Name": name, "Unit": unit}
+        for name, unit in units.items()
     ]
 
     emf_event = {
