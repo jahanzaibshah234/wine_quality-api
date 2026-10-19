@@ -1,15 +1,49 @@
+
+import json
+import logging
+import sys
+import time
+import uuid
+
 import joblib
-from download_model import download_model
-from fastapi import FastAPI
-from pydantic import BaseModel
 import pandas as pd
+from download_model import download_model
+from fastapi import FastAPI, Request
+from pydantic import BaseModel
+
+
+# Configure one-line JSON logs for Docker stdout.
+logger = logging.getLogger("wine_quality_api")
+logger.setLevel(logging.INFO)
+logger.propagate = False
+
+if not logger.handlers:
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    logger.addHandler(handler)
+
+
+def log_event(event: str, **fields):
+    """Write a structured JSON event to the application log."""
+    log_data = {
+        "event": event,
+        "timestamp": time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ",
+            time.gmtime(),
+        ),
+        **fields,
+    }
+
+    logger.info(json.dumps(log_data, allow_nan=False))
+
 
 app = FastAPI(title="Wine Quality Prediction API")
 
+MODEL_NAME = "wine_quality"
 MODEL_PATH = "wine_quality.pkl"
 
+# Keep the existing model download and loading behavior.
 download_model()
-
 model = joblib.load(MODEL_PATH)
 
 
@@ -27,38 +61,123 @@ class WineFeatures(BaseModel):
     alcohol: float
 
 
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    """Track request IDs, response status codes, and latency."""
+    request_id = str(uuid.uuid4())
+    request.state.request_id = request_id
+    start_time = time.perf_counter()
+
+    try:
+        response = await call_next(request)
+
+    except Exception as exc:
+        duration_ms = round(
+            (time.perf_counter() - start_time) * 1000,
+            2,
+        )
+
+        log_event(
+            "request_failed",
+            request_id=request_id,
+            method=request.method,
+            path=request.url.path,
+            status_code=500,
+            duration_ms=duration_ms,
+            error_type=type(exc).__name__,
+        )
+
+        raise
+
+    duration_ms = round(
+        (time.perf_counter() - start_time) * 1000,
+        2,
+    )
+
+    response.headers["X-Request-ID"] = request_id
+
+    log_event(
+        "request_completed",
+        request_id=request_id,
+        method=request.method,
+        path=request.url.path,
+        status_code=response.status_code,
+        duration_ms=duration_ms,
+    )
+
+    return response
+
+
 @app.get("/health")
 def health():
     return {
         "status": "healthy",
-        "model": "wine_quality"
+        "model": MODEL_NAME,
     }
 
 
 @app.post("/predict")
-def predict(features: WineFeatures):
+def predict(features: WineFeatures, request: Request):
+    start_time = time.perf_counter()
+    request_id = request.state.request_id
 
-    data = pd.DataFrame([{
-        "fixed acidity": features.fixed_acidity,
-        "volatile acidity": features.volatile_acidity,
-        "citric acid": features.citric_acid,
-        "residual sugar": features.residual_sugar,
-        "chlorides": features.chlorides,
-        "free sulfur dioxide": features.free_sulfur_dioxide,
-        "total sulfur dioxide": features.total_sulfur_dioxide,
-        "density": features.density,
-        "pH": features.pH,
-        "sulphates": features.sulphates,
-        "alcohol": features.alcohol
-    }])
+    data = pd.DataFrame(
+        [
+            {
+                "fixed acidity": features.fixed_acidity,
+                "volatile acidity": features.volatile_acidity,
+                "citric acid": features.citric_acid,
+                "residual sugar": features.residual_sugar,
+                "chlorides": features.chlorides,
+                "free sulfur dioxide": features.free_sulfur_dioxide,
+                "total sulfur dioxide": features.total_sulfur_dioxide,
+                "density": features.density,
+                "pH": features.pH,
+                "sulphates": features.sulphates,
+                "alcohol": features.alcohol,
+            }
+        ]
+    )
 
-    prediction = model.predict(data)[0]
+    try:
+        prediction = model.predict(data)[0]
+        probabilities = model.predict_proba(data)[0]
+        confidence = float(max(probabilities))
 
-    probabilities = model.predict_proba(data)[0]
+        duration_ms = round(
+            (time.perf_counter() - start_time) * 1000,
+            2,
+        )
 
-    confidence = float(max(probabilities))
+        log_event(
+            "prediction_completed",
+            request_id=request_id,
+            model=MODEL_NAME,
+            prediction=str(prediction),
+            confidence=confidence,
+            status_code=200,
+            duration_ms=duration_ms,
+        )
 
-    return {
-        "prediction": prediction,
-        "confidence": confidence
-    }
+        return {
+            "prediction": prediction,
+            "confidence": confidence,
+        }
+
+    except Exception as exc:
+        duration_ms = round(
+            (time.perf_counter() - start_time) * 1000,
+            2,
+        )
+
+        log_event(
+            "prediction_failed",
+            request_id=request_id,
+            model=MODEL_NAME,
+            status_code=500,
+            duration_ms=duration_ms,
+            error_type=type(exc).__name__,
+        )
+
+        raise
+
